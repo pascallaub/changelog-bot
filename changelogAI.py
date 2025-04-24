@@ -4,13 +4,17 @@ from datetime import datetime
 from openai import OpenAI
 from git import Repo, GitCommandError
 
-# --- OpenAI Client Initialisierung ---
+# --- OpenRouter Client Initialisierung ---
 try:
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    # Verwende OpenRouter Base URL und API Key
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.getenv("OPENROUTER_API_KEY")
+    )
     if not client.api_key:
-        raise ValueError("OpenAI API Key nicht gefunden. Stelle sicher, dass das OPENAI_API_KEY Secret im Workflow gesetzt ist.")
+        raise ValueError("OpenRouter API Key nicht gefunden. Stelle sicher, dass das OPENROUTER_API_KEY Secret im Workflow gesetzt ist.")
 except Exception as e:
-    print(f"Fehler beim Initialisieren des OpenAI Clients: {e}")
+    print(f"Fehler beim Initialisieren des OpenRouter Clients: {e}")
     exit(1)
 
 # --- Git Repo Initialisierung ---
@@ -98,23 +102,42 @@ def get_push_commits(repo, branch_name):
         # traceback.print_exc()
         return None
 
-# --- OpenAI-Anfrage ---
+# --- OpenAI-Anfrage (jetzt OpenRouter) ---
 def ask_openai(prompt: str) -> str:
     if not prompt:
-        print("OpenAI Prompt ist leer. Überspringe Anfrage.")
+        print("OpenRouter Prompt ist leer. Überspringe Anfrage.")
         return "Keine Änderungen zum Dokumentieren gefunden."
     try:
+        # Versuche es mit einem günstigeren Modell oder reduziere max_tokens
+        # model_to_use = "openai/gpt-3.5-turbo" # Günstigere Alternative
+        model_to_use = "openai/gpt-4"
+        max_tokens_limit = 500 # Reduziere das Limit, um unter 666 zu bleiben
+
+        print(f"Sende Prompt an OpenRouter (Modell: {model_to_use}, max_tokens: {max_tokens_limit})...")
         response = client.chat.completions.create(
-            model="gpt-4",
+            model=model_to_use,
             messages=[
                 {"role": "system", "content": "Du bist ein technischer Dokumentationsassistent. Erstelle einen sachlichen, aber community-freundlichen Changelog-Eintrag basierend auf den bereitgestellten Commit-Nachrichten."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.5
+            temperature=0.5,
+            max_tokens=max_tokens_limit # Füge das Token-Limit hinzu
         )
-        return response.choices[0].message.content.strip()
+
+        if response and response.choices and len(response.choices) > 0 and response.choices[0].message:
+            print("Erfolgreiche Antwort von OpenRouter erhalten.")
+            return response.choices[0].message.content.strip()
+        # Spezifische Prüfung auf den Fehler aus der vorherigen Log-Ausgabe
+        elif response and hasattr(response, 'error') and response.error and 'code' in response.error and response.error['code'] == 402:
+             error_message = response.error.get('message', 'Unbekannter Credit-Fehler')
+             print(f"OpenRouter Fehler (Code 402 - Insufficient Credits): {error_message}")
+             return f"Fehler: Nicht genügend OpenRouter Credits. ({error_message})"
+        else:
+            print(f"Unerwartete Antwortstruktur von OpenRouter erhalten: {response}")
+            return "Fehler: Unerwartete Antwortstruktur von OpenRouter."
+
     except Exception as e:
-        print(f"Fehler bei der OpenAI-Anfrage: {e}")
+        print(f"Fehler bei der OpenRouter-Anfrage: {e}")
         return f"Fehler bei der Generierung des Changelog-Eintrags: {e}"
 
 # --- Changelog schreiben ---
@@ -166,10 +189,17 @@ Struktur des Eintrags:
 
 Vermeide es, nur die Commit-Nachrichten aufzulisten. Synthetisiere die Informationen zu einem kohärenten Text.
 """
-    print("Generiere Changelog-Eintrag mit OpenAI...")
+    print("Generiere Changelog-Eintrag mit OpenRouter...")
     changelog_content = ask_openai(prompt)
 
-    if "Fehler bei der Generierung" in changelog_content or not changelog_content.strip():
+    # Überprüfe explizit auf bekannte Fehlermeldungen, bevor geschrieben wird
+    known_error_indicators = [
+        "Fehler bei der Generierung",
+        "Fehler: Unerwartete Antwortstruktur",
+        "Fehler: Nicht genügend OpenRouter Credits" # Neuer Check
+    ]
+    # Prüfe, ob der Inhalt leer ist oder eine bekannte Fehlermeldung enthält
+    if not changelog_content or any(indicator in changelog_content for indicator in known_error_indicators):
         print(f"Überspringe das Schreiben des Changelogs aufgrund des Inhalts oder Fehlers: {changelog_content}")
     else:
         print("Schreibe Changelog-Eintrag...")
