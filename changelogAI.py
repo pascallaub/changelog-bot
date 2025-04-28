@@ -1,8 +1,9 @@
 import os
 import subprocess
+import re
 from datetime import datetime
 from openai import OpenAI
-from git import Repo, GitCommandError
+from git import Repo, GitCommandError, Diff
 
 # --- OpenRouter Client Initialisierung ---
 try:
@@ -34,73 +35,94 @@ def run(cmd):
         print(f"Fehler beim Ausführen von '{cmd}': {e.stderr}")
         return None
 
-# --- Hole Commit-Nachrichten aus dem Push ---
-def get_push_commits(repo, branch_name):
+# --- Hole Commit-Nachrichten und Diff-Informationen aus dem Push ---
+def get_push_details(repo, branch_name):
     commits_info = []
+    diff_summary = "Keine Diff-Informationen verfügbar."
     try:
         before_sha = os.getenv('GITHUB_EVENT_BEFORE')
         after_sha = os.getenv('GITHUB_EVENT_AFTER')
 
         if not before_sha or not after_sha or before_sha == '0000000000000000000000000000000000000000':
-            print("Warnung: Konnte keine 'before'/'after' SHAs finden oder erster Push. Nehme die letzten 5 Commits.")
+            print("Warnung: Konnte keine 'before'/'after' SHAs finden oder erster Push. Nehme die letzten 5 Commits für Nachrichten.")
             commits = list(repo.iter_commits(branch_name, max_count=5))
         else:
-            print(f"Analysiere Commits zwischen {before_sha[:7]} und {after_sha[:7]}")
+            print(f"Analysiere Commits und Diff zwischen {before_sha[:7]} und {after_sha[:7]}")
             try:
-                # Stelle sicher, dass der 'before' Commit lokal existiert
                 repo.commit(before_sha)
-                # Hole die Commits im Bereich
+                repo.commit(after_sha)
                 commits = list(repo.iter_commits(f"{before_sha}..{after_sha}"))
-            except GitCommandError:
-                print(f"Warnung: Konnte 'before' Commit {before_sha} nicht finden. Nehme die letzten 5 Commits als Fallback.")
-                commits = list(repo.iter_commits(branch_name, max_count=5))
-            except ValueError as ve: # Fängt Fehler ab, wenn SHAs ungültig sind
-                 print(f"Fehler beim Verarbeiten der Commit SHAs ({before_sha}, {after_sha}): {ve}. Nehme die letzten 5 Commits.")
-                 commits = list(repo.iter_commits(branch_name, max_count=5))
 
+                raw_diff = repo.git.diff(f"{before_sha}..{after_sha}", '--stat')
+                diff_summary = process_diff_stat(raw_diff)
+
+            except (GitCommandError, ValueError) as e:
+                print(f"Warnung: Fehler beim Holen der Commits oder des Diffs ({e}). Nehme letzte 5 Commits für Nachrichten.")
+                commits = list(repo.iter_commits(branch_name, max_count=5))
 
         if not commits:
             print("Keine neuen Commits in diesem Push gefunden.")
-            return None
+            return None, None
 
-        # Filtere Merge-Commits und sammle relevante Nachrichten
         non_merge_commits_count = 0
-        for commit in reversed(commits): # Älteste zuerst
-            # Prüfe, ob es ein Merge-Commit ist (mehr als 1 Parent)
+        for commit in reversed(commits):
             is_merge = len(commit.parents) > 1
             message_first_line = commit.message.strip().splitlines()[0]
             author_name = commit.author.name
-
-            # Ignoriere typische, nicht informative Merge-Nachrichten
             ignore_merge_message = is_merge and (
                 message_first_line.startswith("Merge branch") or
                 message_first_line.startswith("Merge pull request")
             )
-
             if not ignore_merge_message:
                 commits_info.append(f"- {message_first_line} ({author_name})")
                 if not is_merge:
                     non_merge_commits_count += 1
 
-        # Wenn nur Merge-Commits (oder gar keine relevanten) gefunden wurden, gib eine spezielle Info zurück
         if not commits_info:
-             if any(len(c.parents) > 1 for c in commits): # Prüfe, ob überhaupt Merge Commits da waren
-                  print("Nur Merge-Commits ohne informative Nachrichten gefunden.")
-                  # Optional: Gib eine Standardnachricht zurück, die die AI interpretieren kann
-                  return "Nur Merge-Commits ohne spezifische Änderungsdetails."
-             else:
-                  print("Keine relevanten Commit-Nachrichten gefunden.")
-                  return None # Keine Commits -> Kein Changelog-Eintrag
+            if any(len(c.parents) > 1 for c in commits):
+                print("Nur Merge-Commits ohne informative Nachrichten gefunden.")
+                commit_messages_str = "Nur Merge-Commits ohne spezifische Änderungsdetails."
+            else:
+                print("Keine relevanten Commit-Nachrichten gefunden.")
+                commit_messages_str = None
+        else:
+            commit_messages_str = "\n".join(commits_info)
+            print(f"Gefundene relevante Commit-Nachrichten: {len(commits_info)}")
 
-        print(f"Gefundene relevante Commit-Nachrichten: {len(commits_info)}")
-        return "\n".join(commits_info)
+        return commit_messages_str, diff_summary
 
     except Exception as e:
-        print(f"Fehler beim Abrufen der Commit-Nachrichten: {e}")
-        # Optional: Logge den Traceback für detailliertere Fehlersuche
-        # import traceback
-        # traceback.print_exc()
-        return None
+        print(f"Fehler beim Abrufen der Push-Details: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None
+
+def process_diff_stat(diff_stat_output: str) -> str:
+    """ Verarbeitet die Ausgabe von 'git diff --stat', um eine lesbare Zusammenfassung zu erstellen. """
+    if not diff_stat_output:
+        return "Keine Änderungen im Diff gefunden."
+
+    lines = diff_stat_output.strip().split('\n')
+    summary_line = ""
+    if lines and "changed," in lines[-1]:
+        summary_line = lines.pop().strip()
+
+    relevant_files = []
+    irrelevant_patterns = [
+        r'package-lock\.json', r'yarn\.lock', r'\.gitignore', r'\.env',
+        r'config\.yml', r'\.github/', r'Pipfile\.lock'
+    ]
+    for line in lines:
+        if line.strip() and not any(re.search(pattern, line) for pattern in irrelevant_patterns):
+            relevant_files.append(line.strip())
+
+    if not relevant_files:
+        return f"Keine relevanten Code-Änderungen im Diff gefunden. ({summary_line})"
+
+    processed_summary = "Zusammenfassung der geänderten Dateien:\n" + "\n".join(relevant_files)
+    if summary_line:
+        processed_summary += f"\n\nGesamtstatistik: {summary_line}"
+    return processed_summary
 
 # --- OpenAI-Anfrage (jetzt OpenRouter) ---
 def ask_openai(prompt: str) -> str:
@@ -108,10 +130,8 @@ def ask_openai(prompt: str) -> str:
         print("OpenRouter Prompt ist leer. Überspringe Anfrage.")
         return "Keine Änderungen zum Dokumentieren gefunden."
     try:
-        # Versuche es mit einem günstigeren Modell oder reduziere max_tokens
-        # model_to_use = "openai/gpt-3.5-turbo" # Günstigere Alternative
         model_to_use = "openai/gpt-4"
-        max_tokens_limit = 500 # Reduziere das Limit, um unter 666 zu bleiben
+        max_tokens_limit = 500
 
         print(f"Sende Prompt an OpenRouter (Modell: {model_to_use}, max_tokens: {max_tokens_limit})...")
         response = client.chat.completions.create(
@@ -121,17 +141,16 @@ def ask_openai(prompt: str) -> str:
                 {"role": "user", "content": prompt}
             ],
             temperature=0.5,
-            max_tokens=max_tokens_limit # Füge das Token-Limit hinzu
+            max_tokens=max_tokens_limit
         )
 
         if response and response.choices and len(response.choices) > 0 and response.choices[0].message:
             print("Erfolgreiche Antwort von OpenRouter erhalten.")
             return response.choices[0].message.content.strip()
-        # Spezifische Prüfung auf den Fehler aus der vorherigen Log-Ausgabe
         elif response and hasattr(response, 'error') and response.error and 'code' in response.error and response.error['code'] == 402:
-             error_message = response.error.get('message', 'Unbekannter Credit-Fehler')
-             print(f"OpenRouter Fehler (Code 402 - Insufficient Credits): {error_message}")
-             return f"Fehler: Nicht genügend OpenRouter Credits. ({error_message})"
+            error_message = response.error.get('message', 'Unbekannter Credit-Fehler')
+            print(f"OpenRouter Fehler (Code 402 - Insufficient Credits): {error_message}")
+            return f"Fehler: Nicht genügend OpenRouter Credits. ({error_message})"
         else:
             print(f"Unerwartete Antwortstruktur von OpenRouter erhalten: {response}")
             return "Fehler: Unerwartete Antwortstruktur von OpenRouter."
@@ -163,24 +182,24 @@ def write_changelog(content: str):
 
 # --- Hauptlogik ---
 def main():
-    print("Sammle Commit-Nachrichten für den Changelog...")
-    commit_messages = get_push_commits(repo, current_branch)
+    print("Sammle Commit-Nachrichten und Diff-Informationen für den Changelog...")
+    commit_messages, diff_summary = get_push_details(repo, current_branch)
 
     if not commit_messages or commit_messages == "Nur Merge-Commits ohne spezifische Änderungsdetails.":
         print(f"Keine ausreichenden Commit-Nachrichten für einen detaillierten Changelog gefunden. Status: {commit_messages}")
-        # Optional: Schreibe einen Platzhalter oder nichts
-        # write_changelog("Technische Updates und Merges ohne detaillierte Commit-Nachrichten.")
         return
 
-    # Verbesserter Prompt
     prompt = f"""
-Erstelle einen Changelog-Eintrag für heute, basierend auf den folgenden Commit-Nachrichten.
+Erstelle einen Changelog-Eintrag für heute, basierend auf den folgenden Commit-Nachrichten und Diff-Informationen.
 Konzentriere dich darauf, die *tatsächlichen Änderungen* (neue Features, Bugfixes, Verbesserungen, Refactorings) zusammenzufassen, die durch diese Commits eingeführt wurden.
 Ignoriere generische Merge-Informationen und beschreibe stattdessen, *was* durch die Commits erreicht wurde.
 Formuliere es für ein öffentliches Devlog – klar, verständlich und auf den Nutzen für das Projekt fokussiert.
 
 Commits:
 {commit_messages}
+
+Diff-Zusammenfassung:
+{diff_summary}
 
 Struktur des Eintrags:
 - **Zusammenfassung:** Ein kurzer Überblick über die wichtigsten Änderungen in diesem Update.
@@ -192,13 +211,11 @@ Vermeide es, nur die Commit-Nachrichten aufzulisten. Synthetisiere die Informati
     print("Generiere Changelog-Eintrag mit OpenRouter...")
     changelog_content = ask_openai(prompt)
 
-    # Überprüfe explizit auf bekannte Fehlermeldungen, bevor geschrieben wird
     known_error_indicators = [
         "Fehler bei der Generierung",
         "Fehler: Unerwartete Antwortstruktur",
-        "Fehler: Nicht genügend OpenRouter Credits" # Neuer Check
+        "Fehler: Nicht genügend OpenRouter Credits"
     ]
-    # Prüfe, ob der Inhalt leer ist oder eine bekannte Fehlermeldung enthält
     if not changelog_content or any(indicator in changelog_content for indicator in known_error_indicators):
         print(f"Überspringe das Schreiben des Changelogs aufgrund des Inhalts oder Fehlers: {changelog_content}")
     else:
